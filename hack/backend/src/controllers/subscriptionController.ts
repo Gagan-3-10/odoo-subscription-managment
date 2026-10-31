@@ -1,0 +1,274 @@
+import { Response } from 'express';
+import prisma from '../config/prisma';
+import { AuthenticatedRequest } from '../middleware/auth';
+import { calculateNextBillingDate, calculateTotals, generateDocNumber } from '../utils/billingCalculator';
+import { NotificationService } from '../services/notificationService';
+
+export class SubscriptionController {
+  static async listSubscriptions(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { status, frequency, search, customerId } = req.query;
+
+    const where: any = {};
+    if (status && status !== 'ALL') where.status = status;
+    if (frequency && frequency !== 'ALL') where.billingFrequency = frequency;
+    if (customerId && customerId !== 'ALL') where.customerId = customerId;
+
+    // Customer isolation
+    if (req.user?.role === 'CUSTOMER' && req.user.customerId) {
+      where.customerId = req.user.customerId;
+    }
+
+    if (search) {
+      const q = String(search).trim();
+      where.OR = [
+        { subscriptionNumber: { contains: q } },
+        { customer: { contactName: { contains: q } } },
+        { customer: { companyName: { contains: q } } },
+        { plan: { name: { contains: q } } },
+      ];
+    }
+
+    const subscriptions = await prisma.subscription.findMany({
+      where,
+      include: {
+        customer: true,
+        plan: true,
+        lines: { include: { product: true, variant: true } },
+        _count: {
+          select: { invoices: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json({ success: true, data: subscriptions });
+  }
+
+  static async getSubscriptionById(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { id } = req.params;
+
+    const subscription = await prisma.subscription.findUnique({
+      where: { id },
+      include: {
+        customer: true,
+        plan: true,
+        lines: { include: { product: true, variant: true } },
+        invoices: {
+          orderBy: { issueDate: 'desc' },
+          include: { payments: true },
+        },
+        billingHistories: {
+          orderBy: { executedAt: 'desc' },
+        },
+        activityLogs: {
+          orderBy: { createdAt: 'desc' },
+          include: { user: { select: { name: true, email: true, role: true } } },
+        },
+      },
+    });
+
+    if (!subscription) {
+      res.status(404).json({ success: false, message: 'Subscription not found.' });
+      return;
+    }
+
+    // Customer isolation
+    if (req.user?.role === 'CUSTOMER' && req.user.customerId !== subscription.customerId) {
+      res.status(403).json({ success: false, message: 'Unauthorized' });
+      return;
+    }
+
+    res.json({ success: true, data: subscription });
+  }
+
+  static async createSubscription(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { customerId, planId, billingFrequency, paymentTerms = 'IMMEDIATE', startDate, expiryDate, autoRenew = true, autoClose = false, notes, lines } = req.body;
+
+    const plan = await prisma.plan.findUnique({ where: { id: planId } });
+    if (!plan) {
+      res.status(404).json({ success: false, message: 'Plan not found.' });
+      return;
+    }
+
+    const start = startDate ? new Date(startDate) : new Date();
+    const frequency = billingFrequency || plan.billingFrequency;
+    const expiry = expiryDate ? new Date(expiryDate) : calculateNextBillingDate(start, 'YEARLY');
+    const nextBilling = calculateNextBillingDate(start, frequency);
+
+    const subscriptionNumber = generateDocNumber('SUB');
+
+    // Default lines if not provided
+    const subLines = lines && lines.length > 0 ? lines : [
+      {
+        productId: plan.productId,
+        description: `${plan.name} Base Subscription`,
+        quantity: 1,
+        unitPrice: plan.basePrice,
+        taxRate: 18,
+        discountRate: 0,
+        lineTotal: plan.basePrice * 1.18,
+      },
+    ];
+
+    const totals = calculateTotals(subLines);
+
+    const subscription = await prisma.$transaction(async (tx) => {
+      const sub = await tx.subscription.create({
+        data: {
+          subscriptionNumber,
+          customerId,
+          planId,
+          status: 'ACTIVE',
+          billingFrequency: frequency,
+          paymentTerms,
+          startDate: start,
+          expiryDate: expiry,
+          nextBillingDate: nextBilling,
+          autoRenew: Boolean(autoRenew),
+          autoClose: Boolean(autoClose),
+          subtotal: totals.subtotal,
+          taxAmount: totals.taxAmount,
+          discountAmount: totals.discountAmount,
+          totalAmount: totals.totalAmount,
+          notes,
+          lines: {
+            create: subLines.map((l: any) => ({
+              productId: l.productId,
+              variantId: l.variantId || null,
+              description: l.description,
+              quantity: Number(l.quantity) || 1,
+              unitPrice: Number(l.unitPrice) || 0,
+              taxRate: Number(l.taxRate) || 0,
+              discountRate: Number(l.discountRate) || 0,
+              lineTotal: Number(l.lineTotal) || (Number(l.quantity) * Number(l.unitPrice)),
+            })),
+          },
+        },
+        include: { lines: true, customer: true, plan: true },
+      });
+
+      await tx.activityLog.create({
+        data: {
+          userId: req.user?.id,
+          subscriptionId: sub.id,
+          action: 'SUBSCRIPTION_CREATED',
+          details: `Subscription ${subscriptionNumber} created with ${frequency} billing`,
+        },
+      });
+
+      return sub;
+    });
+
+    res.status(201).json({ success: true, message: 'Subscription created successfully', data: subscription });
+  }
+
+  static async changeStatus(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { id } = req.params;
+    const { action } = req.body; // CONFIRM, ACTIVATE, PAUSE, RESUME, RENEW, CANCEL, CLOSE
+
+    const subscription = await prisma.subscription.findUnique({
+      where: { id },
+      include: { plan: true, customer: true },
+    });
+
+    if (!subscription) {
+      res.status(404).json({ success: false, message: 'Subscription not found.' });
+      return;
+    }
+
+    // Role checks and plan permissions for CUSTOMER role
+    if (req.user?.role === 'CUSTOMER') {
+      if (req.user.customerId !== subscription.customerId) {
+        res.status(403).json({ success: false, message: 'Unauthorized' });
+        return;
+      }
+      if (action === 'PAUSE' || action === 'RESUME') {
+        if (!subscription.plan.pauseAllowed) {
+          res.status(400).json({ success: false, message: 'Pausing is not permitted for your subscription plan.' });
+          return;
+        }
+      }
+      if (action === 'CANCEL') {
+        if (!subscription.plan.earlyCancellation) {
+          res.status(400).json({ success: false, message: 'Early cancellation is not permitted for your subscription plan.' });
+          return;
+        }
+      }
+    }
+
+    let newStatus = subscription.status;
+    let updateData: any = {};
+    const now = new Date();
+
+    switch (action) {
+      case 'CONFIRM':
+        newStatus = 'CONFIRMED';
+        break;
+      case 'ACTIVATE':
+        newStatus = 'ACTIVE';
+        updateData.nextBillingDate = calculateNextBillingDate(now, subscription.billingFrequency);
+        break;
+      case 'PAUSE':
+        newStatus = 'PAUSED';
+        updateData.pausedAt = now;
+        break;
+      case 'RESUME':
+        newStatus = 'ACTIVE';
+        updateData.pausedAt = null;
+        updateData.nextBillingDate = calculateNextBillingDate(now, subscription.billingFrequency);
+        break;
+      case 'RENEW':
+        newStatus = 'ACTIVE';
+        updateData.expiryDate = calculateNextBillingDate(subscription.expiryDate, 'YEARLY');
+        updateData.nextBillingDate = calculateNextBillingDate(now, subscription.billingFrequency);
+        break;
+      case 'CANCEL':
+        newStatus = 'CANCELLED';
+        break;
+      case 'CLOSE':
+        newStatus = 'CLOSED';
+        break;
+      default:
+        res.status(400).json({ success: false, message: `Invalid action: ${action}` });
+        return;
+    }
+
+    updateData.status = newStatus;
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const sub = await tx.subscription.update({
+        where: { id },
+        data: updateData,
+        include: { plan: true, customer: true },
+      });
+
+      await tx.activityLog.create({
+        data: {
+          userId: req.user?.id,
+          subscriptionId: sub.id,
+          action: `SUBSCRIPTION_${action}`,
+          details: `Subscription ${sub.subscriptionNumber} status updated to ${newStatus} (Action: ${action})`,
+        },
+      });
+
+      return sub;
+    });
+
+    // Notify customer
+    if (updated.customer.userId) {
+      await NotificationService.send({
+        userId: updated.customer.userId,
+        title: `Subscription Status Updated: ${updated.subscriptionNumber}`,
+        message: `Your subscription is now ${newStatus}.`,
+        type: newStatus === 'ACTIVE' ? 'SUCCESS' : newStatus === 'CANCELLED' ? 'WARNING' : 'INFO',
+        link: `/subscriptions/${updated.id}`,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Subscription ${action.toLowerCase()}d successfully`,
+      data: updated,
+    });
+  }
+}
